@@ -1,23 +1,36 @@
 /* =====================================================================
    Explorateur de configs — ProCurve / OmniSwitch
+   Choix de conception orientés performance :
+   - visionneuse virtualisée (seules les lignes visibles sont dans le DOM)
+   - métadonnées des fichiers chargées à la demande (pas de stat sur tout l'arbre)
+   - cache de contenu : mémoire (LRU) + IndexedDB optionnel, validé par taille/date
+   - recherche : test global par fichier, découpage en lignes seulement si nécessaire,
+     traitement par tranches de temps pour ne jamais figer l'interface
    ===================================================================== */
 const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const reEsc=s=>s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+const cssEsc=s=>(window.CSS&&CSS.escape)?CSS.escape(s):s.replace(/["\\]/g,'\\$&');
 const fmt=n=>n<1024?n+' o':n<1048576?(n/1024).toFixed(1)+' Ko':(n/1048576).toFixed(1)+' Mo';
 const dt=t=>new Date(t).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'});
 const parent=p=>p.includes('/')?p.slice(0,p.lastIndexOf('/')):'';
 const base=p=>p.slice(p.lastIndexOf('/')+1);
-const MAX_FILE=8*1024*1024, MAX_HITS=2000, MAX_RICH=40000, HAS_FSA=!!window.showDirectoryPicker;
+const debounce=(fn,ms)=>{ let t=0; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; };
+const tick=()=>new Promise(r=>setTimeout(r,0));
+const COLL=new Intl.Collator('fr',{sensitivity:'base',numeric:true});
+const MAX_FILE=8*1024*1024, MAX_HITS=2000, MAX_RICH=200000, HAS_FSA=!!window.showDirectoryPicker;
+const ROW_H=19, BUF=30, MEM_BUDGET=120e6;           // hauteur de ligne (px), tampon de lignes rendues, budget cache mémoire (caractères)
 const VN={pc:'ProCurve / ArubaOS-Switch',os:'OmniSwitch',gen:'Générique'};
 
-let files=[], tree=new Map(), rootName='', cur={dir:'',file:null}, stopFlag=false, showingResults=false;
-let doc=null, lastSearch=null;
+let files=[], fileByPath=new Map(), tree=new Map(), rootName='', cur={dir:'',file:null}, renderedDir=null;
+let stopFlag=false, busy=false, showingResults=false, doc=null, lastSearch=null, listToken=0, openSeq=0;
+const VW={on:false,d:null,rs:0,re:0,raf:0,charW:0};
 
 /* ---------- index ---------- */
 function build(list,name){
-  files=list; rootName=name; tree=new Map([['',{d:new Set(),f:[]}]]);
+  files=list; rootName=name; fileByPath=new Map(); tree=new Map([['',{d:new Set(),f:[]}]]);
   for(const f of files){
+    f.name=base(f.path); f.lc=f.name.toLowerCase(); fileByPath.set(f.path,f);
     const p=f.path.split('/'); let acc='';
     for(let i=0;i<p.length-1;i++){
       const par=acc; acc+=(acc?'/':'')+p[i];
@@ -26,26 +39,29 @@ function build(list,name){
     }
     tree.get(acc).f.push(f);
   }
-  cur={dir:'',file:null}; doc=null; lastSearch=null;
-  $('#info').textContent=name+' — '+files.length+' fichiers';
-  $('#q').disabled=false; $('#go').disabled=false;
-  renderList(); empty();
+  tree.forEach(n=>{ n.dirs=[...n.d].sort((a,b)=>COLL.compare(base(a),base(b))); n.f.sort((a,b)=>COLL.compare(a.name,b.name)); });
+  cur={dir:'',file:null}; doc=null; lastSearch=null; renderedDir=null;
+  setInfo(); $('#q').disabled=false; $('#go').disabled=false;
+  clearFilter(); renderList(); empty();
+  pruneCache();
 }
-function empty(){ showingResults=false; $('#vh').hidden=true; $('#body').innerHTML='<div class="empty">Sélectionne un fichier ou lance une recherche.</div>'; }
-function setBusy(on){ $('#go').hidden=on; $('#stop').hidden=!on; }
+function setInfo(t){ $('#info').textContent=t!=null?t:(rootName?rootName+' — '+files.length+' fichiers':''); }
+function empty(){ VW.on=false; VW.d=null; showingResults=false; $('#vh').hidden=true; $('#body').innerHTML='<div class="empty">Sélectionne un fichier ou lance une recherche.</div>'; }
+function setBusy(on){ busy=on; $('#go').hidden=on; $('#stop').hidden=!on; }
 
 /* ---------- sources : File System Access API (Chrome/Edge) ou <input webkitdirectory> (Firefox) ---------- */
+/* L'énumération ne fait AUCUN stat : taille/date sont chargées à la demande (voir fillMeta). */
 async function walk(dirHandle,prefix,out){
   const jobs=[];
   for await(const [name,h] of dirHandle.entries()){
     const path=prefix?prefix+'/'+name:name;
     if(h.kind==='directory') jobs.push(walk(h,path,out));
-    else jobs.push(h.getFile().then(fl=>out.push({path,size:fl.size,mtime:fl.lastModified,get:async()=>h.getFile()})).catch(()=>{}));
+    else out.push({path,size:null,mtime:null,get:()=>h.getFile()});
   }
   await Promise.all(jobs);
 }
 async function loadHandle(h){
-  $('#info').textContent='Lecture de l\'arborescence…';
+  setInfo('Lecture de l\'arborescence…');
   const out=[]; await walk(h,'',out);
   build(out,h.name);
 }
@@ -62,56 +78,151 @@ $('#pick').onclick=async()=>{
 };
 $('#fallback').onchange=e=>loadFallback(e.target.files);
 
-/* dernier dossier mémorisé (Chrome/Edge) */
-function idb(){return new Promise((res,rej)=>{const r=indexedDB.open('cfgbrowser',1);r.onupgradeneeded=()=>r.result.createObjectStore('h');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
-async function saveHandle(h){try{const db=await idb();db.transaction('h','readwrite').objectStore('h').put(h,'last')}catch{}}
+/* ---------- IndexedDB : dernier dossier + cache de contenu (optionnel) ---------- */
+let persist=false; try{ persist=localStorage.getItem('persist')==='1'; }catch{}
+let dbP=null;
+function db(){
+  return dbP||(dbP=new Promise((res,rej)=>{
+    try{
+      const r=indexedDB.open('cfgbrowser',2);
+      r.onupgradeneeded=()=>{ const d=r.result; if(!d.objectStoreNames.contains('h')) d.createObjectStore('h'); if(!d.objectStoreNames.contains('txt')) d.createObjectStore('txt'); };
+      r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); r.onblocked=()=>rej(new Error('IndexedDB bloquée'));
+    }catch(e){ rej(e); }
+  }).catch(e=>{ dbP=null; persist=false; throw e; }));
+}
+const idbReq=(store,mode,fn)=>db().then(d=>new Promise((res,rej)=>{
+  const tx=d.transaction(store,mode), rq=fn(tx.objectStore(store));
+  tx.oncomplete=()=>res(rq&&rq.result); tx.onerror=tx.onabort=()=>rej(tx.error);
+}));
+async function saveHandle(h){ try{ await idbReq('h','readwrite',s=>{ s.put(h,'last'); }); }catch{} }
 async function restoreHandle(){
   if(!HAS_FSA) return;
   try{
-    const db=await idb();
-    const h=await new Promise(res=>{const r=db.transaction('h').objectStore('h').get('last');r.onsuccess=()=>res(r.result)});
+    const h=await idbReq('h','readonly',s=>s.get('last'));
     if(!h) return;
     const b=$('#reopen'); b.hidden=false; b.textContent='Rouvrir « '+h.name+' »';
-    b.onclick=async()=>{ if(await h.requestPermission({mode:'read'})==='granted'){ b.hidden=true; loadHandle(h);} };
+    b.onclick=async()=>{ if(await h.requestPermission({mode:'read'})==='granted'){ b.hidden=true; loadHandle(h); } };
   }catch{}
 }
 
+/* ---------- cache de contenu ---------- */
+const mem=new Map(); let memChars=0;                 // LRU en mémoire (ordre d'insertion = ordre d'usage)
+const bad=new Map();                                 // fichiers binaires : évite de les relire
+const putQ=[]; let putT=0;
+const UTF8=new TextDecoder('utf-8',{fatal:true}), W1252=new TextDecoder('windows-1252');
+function memGet(key,size,mtime){
+  const e=mem.get(key);
+  if(e&&e.size===size&&e.mtime===mtime){ mem.delete(key); mem.set(key,e); return e.text; }
+  return null;
+}
+function memPut(key,size,mtime,text){
+  const old=mem.get(key); if(old){ memChars-=old.text.length; mem.delete(key); }
+  mem.set(key,{size,mtime,text}); memChars+=text.length;
+  for(const [k,v] of mem){ if(memChars<=MEM_BUDGET||mem.size<=1) break; mem.delete(k); memChars-=v.text.length; }
+}
+async function idbGetText(key,size,mtime){
+  if(!persist) return null;
+  try{ const v=await idbReq('txt','readonly',s=>s.get(key)); return v&&v.size===size&&v.mtime===mtime?v.text:null; }
+  catch{ return null; }
+}
+function idbQueue(key,size,mtime,text){
+  if(!persist) return;
+  putQ.push([key,{size,mtime,text}]);
+  if(!putT) putT=setTimeout(flushPuts,400);
+}
+async function flushPuts(){
+  putT=0; if(!putQ.length||!persist) return;
+  const batch=putQ.splice(0,100);
+  try{ await idbReq('txt','readwrite',s=>{ batch.forEach(([k,v])=>s.put(v,k)); }); }
+  catch(e){ if(e&&e.name==='QuotaExceededError') persist=false; }
+  if(putQ.length) putT=setTimeout(flushPuts,50);
+}
+async function pruneCache(){                          // retire du cache disque les fichiers disparus du dossier
+  if(!persist) return;
+  try{
+    const keys=await idbReq('txt','readonly',s=>s.getAllKeys(IDBKeyRange.bound(rootName+'|',rootName+'|\uffff')));
+    const stale=keys.filter(k=>!fileByPath.has(k.slice(rootName.length+1)));
+    if(stale.length) await idbReq('txt','readwrite',s=>{ stale.forEach(k=>s.delete(k)); });
+  }catch{}
+}
+async function clearCache(disk=true){
+  mem.clear(); memChars=0; bad.clear(); putQ.length=0;
+  if(disk){ try{ await idbReq('txt','readwrite',s=>{ s.clear(); }); }catch{} }
+}
+/* Retourne le texte d'un fichier : mémoire -> disque (si activé) -> lecture réseau. Renseigne f.size / f.mtime. */
+async function getText(f){
+  const file=await f.get();
+  f.size=file.size; f.mtime=file.lastModified;
+  if(file.size>MAX_FILE) throw new Error('fichier trop volumineux ('+Math.round(file.size/1048576)+' Mo)');
+  const key=rootName+'|'+f.path, b=bad.get(key);
+  if(b&&b.size===file.size&&b.mtime===file.lastModified) throw new Error('fichier binaire');
+  let t=memGet(key,file.size,file.lastModified);
+  if(t!==null) return t;
+  t=await idbGetText(key,file.size,file.lastModified);
+  if(t===null){
+    const buf=new Uint8Array(await file.arrayBuffer());
+    if(buf.subarray(0,4096).includes(0)){ bad.set(key,{size:file.size,mtime:file.lastModified}); throw new Error('fichier binaire'); }
+    try{ t=UTF8.decode(buf); }catch{ t=W1252.decode(buf); }
+    idbQueue(key,file.size,file.lastModified,t);
+  }
+  memPut(key,file.size,file.lastModified,t);
+  return t;
+}
+
 /* ---------- liste des fichiers ---------- */
+const metaTxt=f=>f.size==null?'…':(f.mtime?fmt(f.size)+' · '+dt(f.mtime):'—');
+function clearFilter(){ const i=$('#filter'); i.value=''; if(i.nextElementSibling) i.nextElementSibling.hidden=true; }
 function renderList(){
   const node=tree.get(cur.dir); if(!node) return;
-  const q=$('#filter').value.toLowerCase();
+  const q=$('#filter').value.toLowerCase(), tok=++listToken;
   const parts=cur.dir?cur.dir.split('/'):[]; let acc='';
   let c='<a data-d="">'+esc(rootName)+'</a>';
-  parts.forEach(p=>{acc+=(acc?'/':'')+p; c+=' / <a data-d="'+esc(acc)+'">'+esc(p)+'</a>';});
+  parts.forEach(p=>{ acc+=(acc?'/':'')+p; c+=' / <a data-d="'+esc(acc)+'">'+esc(p)+'</a>'; });
   $('#crumbs').innerHTML=c;
-  $('#crumbs').querySelectorAll('a').forEach(a=>a.onclick=()=>{cur.dir=a.dataset.d;$('#filter').value='';renderList()});
   let h=cur.dir?'<div class="row" data-up="1"><span>⬆️</span><span class="n">..</span></div>':'';
-  [...node.d].sort((a,b)=>a.localeCompare(b,'fr',{sensitivity:'base'})).forEach(d=>{
-    const n=d.slice(d.lastIndexOf('/')+1);
-    if(!q||n.toLowerCase().includes(q)) h+='<div class="row" data-dir="'+esc(d)+'"><span>📁</span><span class="n">'+esc(n)+'</span></div>';
-  });
-  [...node.f].sort((a,b)=>a.path.localeCompare(b.path,'fr',{sensitivity:'base'})).forEach(f=>{
-    const n=base(f.path);
-    if(!q||n.toLowerCase().includes(q)) h+='<div class="row'+(f.path===cur.file?' sel':'')+'" data-f="'+esc(f.path)+'" title="'+esc(n)+'"><span>📄</span><span class="n">'+esc(n)+'<span class="m">'+fmt(f.size)+' · '+dt(f.mtime)+'</span></span></div>';
-  });
+  for(const d of node.dirs){ const n=base(d); if(!q||n.toLowerCase().includes(q)) h+='<div class="row" data-dir="'+esc(d)+'"><span>📁</span><span class="n">'+esc(n)+'</span></div>'; }
+  const pending=[];
+  for(const f of node.f){
+    if(q&&!f.lc.includes(q)) continue;
+    if(f.size==null) pending.push(f);
+    h+='<div class="row'+(f.path===cur.file?' sel':'')+'" data-f="'+esc(f.path)+'" title="'+esc(f.name)+'"><span>📄</span><span class="n">'+esc(f.name)+'<span class="m" data-mp="'+esc(f.path)+'">'+metaTxt(f)+'</span></span></div>';
+  }
   $('#list').innerHTML=h||'<div class="note">Vide</div>';
-  $('#list').querySelectorAll('.row').forEach(r=>r.onclick=()=>{
-    if(r.dataset.up){cur.dir=parent(cur.dir);$('#filter').value='';renderList();}
-    else if(r.dataset.dir!==undefined){cur.dir=r.dataset.dir;$('#filter').value='';renderList();}
-    else openFile(r.dataset.f,0);
-  });
+  renderedDir=cur.dir;
+  if(pending.length) fillMeta(pending,tok);
 }
-$('#filter').oninput=renderList;
-
-/* ---------- lecture ---------- */
-async function readText(f){
-  const file=await f.get();
-  if(file.size>MAX_FILE) throw new Error('fichier trop volumineux ('+Math.round(file.size/1048576)+' Mo)');
-  const buf=new Uint8Array(await file.arrayBuffer());
-  if(buf.subarray(0,4096).includes(0)) throw new Error('fichier binaire');
-  try{ return new TextDecoder('utf-8',{fatal:true}).decode(buf); }
-  catch{ return new TextDecoder('windows-1252').decode(buf); }
+/* taille/date : chargées à la demande, 12 en parallèle, uniquement pour le dossier affiché */
+async function fillMeta(list,tok){
+  const els=new Map(); $('#list').querySelectorAll('[data-mp]').forEach(e=>els.set(e.dataset.mp,e));
+  let i=0;
+  const worker=async()=>{
+    while(i<list.length){
+      const f=list[i++]; if(f.size!=null) continue;
+      try{ const fl=await f.get(); f.size=fl.size; f.mtime=fl.lastModified; }catch{ f.size=0; f.mtime=0; }
+      if(tok===listToken){ const el=els.get(f.path); if(el) el.textContent=metaTxt(f); }
+    }
+  };
+  await Promise.all(Array.from({length:12},worker));
 }
+function markSel(){
+  const l=$('#list'), o=l.querySelector('.row.sel'); if(o) o.classList.remove('sel');
+  if(cur.file){ const n=l.querySelector('.row[data-f="'+cssEsc(cur.file)+'"]'); if(n) n.classList.add('sel'); }
+}
+$('#list').addEventListener('click',e=>{
+  const r=e.target.closest('.row'); if(!r) return;
+  if(r.dataset.up){ cur.dir=parent(cur.dir); clearFilter(); renderList(); }
+  else if(r.dataset.dir!==undefined){ cur.dir=r.dataset.dir; clearFilter(); renderList(); }
+  else openFile(r.dataset.f,0);
+});
+$('#crumbs').addEventListener('click',e=>{ const a=e.target.closest('a[data-d]'); if(a){ cur.dir=a.dataset.d; clearFilter(); renderList(); } });
+$('#filter').oninput=debounce(renderList,80);
+/* préchargement : survol prolongé d'un fichier -> il est déjà en cache au clic */
+let hoverT=0;
+$('#list').addEventListener('mouseover',e=>{
+  clearTimeout(hoverT);
+  const r=e.target.closest('.row[data-f]'); if(!r||busy) return;
+  hoverT=setTimeout(()=>{ const f=fileByPath.get(r.dataset.f); if(f&&(f.size==null||f.size<2e6)&&(!doc||doc.path!==f.path)) getText(f).catch(()=>{}); },200);
+});
 
 /* =====================================================================
    Analyse : constructeur, coloration, sections repliables
@@ -137,6 +248,7 @@ const KW=new Set(['name','tagged','untagged','exit','enable','disable','admin-st
 const NEG=/^(no|shutdown|disable|disabled|forbid)$/i;
 const ID_HEAD=/^(vlan|interface|interfaces)$/i;
 function tokenize(l){
+  if(l.length>2000) return [['',l]];
   const t=l.trimStart(), c=t[0];
   if(c===';'||c==='!'||c==='#') return [['c-cm',l]];
   const top=l.length===t.length, fw=(/^\s*(\S+)/.exec(l)||[])[1]||'';
@@ -264,96 +376,156 @@ function computeFolds(lines,vendor){
 function analyze(path,text,f){
   const lines=text.split(/\r?\n/);
   const vendor=detectVendor(lines), rich=lines.length<=MAX_RICH;
-  return {path,text,lines,size:f.size,mtime:f.mtime,vendor,rich,segs:[],rows:[],collapsed:new Set(),
-          regions:rich?computeFolds(lines,vendor):[]};
+  let maxLen=0; for(let i=0;i<lines.length;i++) if(lines[i].length>maxLen) maxLen=lines[i].length;
+  const regions=rich?computeFolds(lines,vendor):[];
+  const grpAt=new Map(), foldAt=new Map();
+  regions.forEach((r,idx)=>{
+    if(r.kind==='group'){ if(!grpAt.has(r.s)) grpAt.set(r.s,[]); grpAt.get(r.s).push(idx); }
+    else foldAt.set(r.s,idx);
+  });
+  return {path,text,lines,size:f.size,mtime:f.mtime,vendor,rich,maxLen,regions,grpAt,foldAt,
+          collapsed:new Set(),vis:null,pos:null,n:0,flash:-1,rg:null,matchLines:[],matchCount:0};
 }
 
 /* =====================================================================
-   Visionneuse
+   Visionneuse virtualisée
+   d.vis : éléments affichés dans l'ordre (index de ligne >=0, ou -(région+1) pour un en-tête de groupe)
+   d.pos : index de ligne -> position dans d.vis (-1 si masquée par un repli)
    ===================================================================== */
+function rebuildVis(d){
+  const n=d.lines.length, R=d.regions;
+  let diff=null;
+  if(d.collapsed.size){ diff=new Int32Array(n+2); d.collapsed.forEach(i=>{ const r=R[i]; diff[r.hideFrom]++; diff[r.e+1]--; }); }
+  const vis=new Int32Array(n+R.length), pos=new Int32Array(n).fill(-1);
+  let m=0, acc=0;
+  for(let i=0;i<n;i++){
+    const gs=d.grpAt.get(i);
+    if(gs) for(const idx of gs){
+      let a=R[idx].parent, hid=false;
+      while(a){ if(d.collapsed.has(a.idx)){ hid=true; break; } a=a.parent; }
+      if(!hid) vis[m++]=-(idx+1);
+    }
+    if(diff){ acc+=diff[i]; if(acc>0) continue; }
+    pos[i]=m; vis[m++]=i;
+  }
+  d.vis=vis.subarray(0,m); d.pos=pos; d.n=m;
+}
+function renderRows(d,rs,re){
+  const R=d.regions; let h='';
+  for(let k=rs;k<re;k++){
+    const it=d.vis[k];
+    if(it<0){
+      const idx=-it-1, r=R[idx], col=d.collapsed.has(idx);
+      h+='<div class="vr grp" data-r="'+idx+'"><span class="f t">'+(col?'▸':'▾')+'</span><span class="l"></span><span class="c"><b>'+esc(r.label)+'</b> — '+r.count+' '+r.unit+'</span></div>';
+      continue;
+    }
+    const l=d.lines[it];
+    const ranges=d.rg?rangesOf(l,d.rg):[];
+    const segs=d.rich?tokenize(l):[['',l]];
+    const fi=d.foldAt.get(it), r=fi!==undefined?R[fi]:null, col=!!r&&d.collapsed.has(fi);
+    h+='<div class="vr'+((r&&r.kind==='section')?' sec':'')+(it===d.flash?' flash':'')+'"'+(r?' data-r="'+fi+'"':'')+'><span class="f'+(r?' t':'')+'">'+(r?(col?'▸':'▾'):'')+'</span><span class="l">'+(it+1)+'</span><span class="c">'+emit(segs,ranges)+(col?'<span class="fd">… '+(r.e-r.hideFrom+1)+' lignes</span>':'')+'</span></div>';
+  }
+  return h;
+}
+function measureChar(){
+  if(VW.charW) return VW.charW;
+  const p=document.createElement('span'); p.className='vprobe'; p.textContent='M'.repeat(200);
+  const b=$('#body'); b.appendChild(p);
+  const w=p.getBoundingClientRect().width/200; b.removeChild(p);
+  return VW.charW=(w>1?w:7.6);
+}
+function mountViewer(d){
+  const b=$('#body'); b.innerHTML='<div class="vs"><div class="vw"></div></div>'; b.scrollTop=0;
+  b.querySelector('.vs').style.minWidth=Math.ceil(100+Math.min(d.maxLen,5000)*measureChar())+'px';
+  VW.on=true; VW.d=null; VW.rs=0; VW.re=0;
+}
+function setHeight(){ const vs=$('#body').querySelector('.vs'); if(vs&&doc) vs.style.height=(doc.n*ROW_H)+'px'; }
+function updateViewer(force){
+  const d=doc; if(!d||!VW.on) return;
+  const b=$('#body'), vw=b.querySelector('.vw'); if(!vw) return;
+  const top=b.scrollTop, hgt=b.clientHeight||600;
+  const a=Math.max(0,Math.floor(top/ROW_H)), z=Math.min(d.n,Math.ceil((top+hgt)/ROW_H));
+  const okT=VW.rs===0||a-VW.rs>=8, okB=VW.re>=d.n||VW.re-z>=8;
+  if(!force&&VW.d===d&&a>=VW.rs&&z<=VW.re&&okT&&okB) return;   // la fenêtre rendue couvre déjà la zone visible
+  const rs=Math.max(0,a-BUF), re=Math.min(d.n,z+BUF);
+  vw.style.top=(rs*ROW_H)+'px'; vw.innerHTML=renderRows(d,rs,re);
+  VW.d=d; VW.rs=rs; VW.re=re;
+}
+function refresh(){ rebuildVis(doc); setHeight(); updateViewer(true); }
+function scrollToLine(i){
+  const d=doc, p=d.pos[i];
+  if(p>=0){ const b=$('#body'); b.scrollTop=Math.max(0,p*ROW_H-b.clientHeight/2+ROW_H/2); }
+  updateViewer(true);
+}
+function revealLine(d,i){
+  if(!d.collapsed.size) return;
+  d.regions.forEach((r,idx)=>{ if(d.collapsed.has(idx)&&r.hideFrom<=i&&i<=r.e) d.collapsed.delete(idx); });
+}
+function revealMatches(d){
+  const cl=[...d.collapsed]; if(!cl.length) return;
+  for(const i of d.matchLines){
+    for(let k=0;k<cl.length;k++){
+      const idx=cl[k], r=d.regions[idx];
+      if(r.hideFrom<=i&&i<=r.e){ d.collapsed.delete(idx); cl.splice(k,1); k--; }
+    }
+    if(!cl.length) break;
+  }
+}
+function toggleRegion(idx){
+  const d=doc, b=$('#body'); if(!d) return;
+  const key=d.regions[idx].kind==='group'?-(idx+1):d.regions[idx].s;
+  const at=()=>key<0?d.vis.indexOf(key):d.pos[key];
+  const off=at()*ROW_H-b.scrollTop;                    // l'en-tête cliqué reste à la même place à l'écran
+  if(d.collapsed.has(idx)) d.collapsed.delete(idx); else d.collapsed.add(idx);
+  rebuildVis(d); setHeight();
+  const ni=at(); if(ni>=0) b.scrollTop=Math.max(0,ni*ROW_H-off);
+  updateViewer(true);
+}
+function runFind(){
+  const d=doc; if(!d) return;
+  const term=($('#ff')||{}).value||'';
+  d.rg=term?new RegExp(reEsc(term),'gi'):null; d.matchLines=[]; d.matchCount=0; d.flash=-1;
+  if(d.rg){
+    const t=new RegExp(reEsc(term),'i');
+    for(let i=0;i<d.lines.length;i++){ const l=d.lines[i]; if(t.test(l)){ d.matchLines.push(i); d.matchCount+=rangesOf(l,d.rg).length; } }
+  }
+  $('#fc').textContent=term?d.matchCount+' occ.':'';
+  if(d.matchLines.length) revealMatches(d);
+  rebuildVis(d); setHeight();
+  if(d.matchLines.length) scrollToLine(d.matchLines[0]); else updateViewer(true);
+}
+
 async function openFile(path,line){
-  const f=files.find(x=>x.path===path); if(!f) return;
+  const f=fileByPath.get(path); if(!f) return;
+  const tok=++openSeq;
   try{
-    if(!doc||doc.path!==path){ doc=analyze(path,await readText(f),f); }
-    const d=doc;
-    showingResults=false; cur.file=path; cur.dir=parent(path); renderList();
+    let d=doc;
+    if(!d||d.path!==path){ const text=await getText(f); if(tok!==openSeq) return; d=analyze(path,text,f); doc=d; }
+    d.rg=null; d.matchLines=[]; d.matchCount=0; d.flash=line>0?line-1:-1;
+    showingResults=false; cur.file=path;
+    if(renderedDir!==parent(path)){ cur.dir=parent(path); renderList(); } else markSel();
     const vh=$('#vh'); vh.hidden=false;
     vh.innerHTML='<span class="t">'+esc(path)+'</span><span class="tag">'+VN[d.vendor]+'</span>'+
       '<span class="m">'+fmt(d.size)+' · '+dt(d.mtime)+' · '+d.lines.length+' lignes'+(d.rich?'':' · coloration désactivée (fichier volumineux)')+'</span>'+
       '<span class="fld" style="margin-left:auto"><input type="text" id="ff" placeholder="Chercher dans le fichier…" style="width:220px"><button class="x" type="button" title="Effacer" hidden>×</button></span><span class="m" id="fc"></span>'+
       (d.regions.length?'<button class="sec" id="fa">Tout replier</button><button class="sec" id="ua">Tout déplier</button>':'')+
       '<button class="sec" id="cp">Copier</button><button class="sec" id="dl">Télécharger</button>';
-    $('#ff').oninput=()=>draw(0);
+    $('#ff').oninput=debounce(runFind,150);
     if(d.regions.length){
-      $('#fa').onclick=()=>{ d.regions.forEach((r,i)=>d.collapsed.add(i)); applyFolds(); };
-      $('#ua').onclick=()=>{ d.collapsed.clear(); applyFolds(); };
+      $('#fa').onclick=()=>{ d.regions.forEach((r,i)=>d.collapsed.add(i)); refresh(); };
+      $('#ua').onclick=()=>{ d.collapsed.clear(); refresh(); };
     }
-    $('#cp').onclick=()=>navigator.clipboard.writeText(d.text).then(()=>{$('#cp').textContent='Copié ✓';setTimeout(()=>$('#cp').textContent='Copier',1200)});
-    $('#dl').onclick=async()=>{const fl=await f.get();const a=document.createElement('a');a.href=URL.createObjectURL(fl);a.download=base(path);a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000)};
-    draw(line);
-  }catch(e){ doc=null; cur.file=null; $('#vh').hidden=true; $('#body').innerHTML='<div class="err">'+esc(path)+' : '+esc(e.message)+'</div>'; }
-}
-
-function revealLine(i){
-  const d=doc; if(!d.collapsed.size) return;
-  d.regions.forEach((r,idx)=>{ if(d.collapsed.has(idx)&&r.hideFrom<=i&&i<=r.e) d.collapsed.delete(idx); });
-}
-function draw(line){
-  const d=doc, term=($('#ff')||{}).value||'', rg=term?new RegExp(reEsc(term),'gi'):null;
-  if(line>0) revealLine(line-1);
-  const grpAt=new Map(), foldAt=new Map();
-  d.regions.forEach((r,idx)=>{
-    if(r.kind==='group'){ if(!grpAt.has(r.s)) grpAt.set(r.s,[]); grpAt.get(r.s).push(idx); }
-    else foldAt.set(r.s,idx);
-  });
-  let h='<table class="code">', cnt=0, first=0;
-  for(let i=0;i<d.lines.length;i++){
-    const l=d.lines[i];
-    (grpAt.get(i)||[]).forEach(idx=>{
-      const r=d.regions[idx];
-      h+='<tr class="grp" data-r="'+idx+'"><td class="f t">▾</td><td class="l"></td><td class="c"><b>'+esc(r.label)+'</b> — '+r.count+' '+r.unit+'</td></tr>';
-    });
-    const ranges=rg?rangesOf(l,rg):[];
-    if(ranges.length){ cnt+=ranges.length; if(!first) first=i+1; revealLine(i); }
-    let segs; if(d.rich) segs=d.segs[i]||(d.segs[i]=tokenize(l)); else segs=[['',l]];
-    const fi=foldAt.get(i), r=fi!==undefined?d.regions[fi]:null;
-    const cls=((r&&r.kind==='section')?'sec ':'')+(line===i+1?'flash':'');
-    h+='<tr id="L'+(i+1)+'"'+(r?' data-r="'+fi+'"':'')+(cls.trim()?' class="'+cls.trim()+'"':'')+'><td class="f'+(r?' t':'')+'">'+(r?'▾':'')+'</td><td class="l">'+(i+1)+'</td><td class="c">'+emit(segs,ranges)+(r?'<span class="fd">… '+(r.e-r.hideFrom+1)+' lignes</span>':'')+'</td></tr>';
+    $('#cp').onclick=()=>navigator.clipboard.writeText(d.text).then(()=>{ $('#cp').textContent='Copié ✓'; setTimeout(()=>$('#cp').textContent='Copier',1200); });
+    $('#dl').onclick=async()=>{ const fl=await f.get(); const a=document.createElement('a'); a.href=URL.createObjectURL(fl); a.download=base(path); a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),5000); };
+    mountViewer(d);
+    if(line>0) revealLine(d,line-1);
+    rebuildVis(d); setHeight();
+    if(line>0) scrollToLine(line-1); else updateViewer(true);
+  }catch(e){
+    if(tok!==openSeq) return;
+    doc=null; cur.file=null; VW.on=false; $('#vh').hidden=true;
+    $('#body').innerHTML='<div class="err">'+esc(path)+' : '+esc(e.message)+'</div>';
   }
-  $('#body').innerHTML=h+'</table>';
-  d.rows=[];
-  $('#body').querySelectorAll('table.code tr').forEach(tr=>{
-    if(tr.id) d.rows[+tr.id.slice(1)-1]=tr;
-    else if(tr.dataset.r!==undefined){ const r=d.regions[+tr.dataset.r]; r.tr=tr; r.caret=tr.firstChild; }
-  });
-  d.regions.forEach(r=>{ if(r.kind!=='group'){ r.tr=d.rows[r.s]; r.caret=r.tr&&r.tr.firstChild; } });
-  applyFolds();
-  $('#fc').textContent=term?cnt+' occ.':'';
-  const tgt=line?document.getElementById('L'+line):(first?document.getElementById('L'+first):null);
-  if(tgt) tgt.scrollIntoView({block:'center'});
-}
-function applyFolds(){
-  const d=doc; if(!d||!d.regions.length) return;
-  const n=d.lines.length, diff=new Int32Array(n+2);
-  d.collapsed.forEach(i=>{ const r=d.regions[i]; diff[r.hideFrom]++; diff[r.e+1]--; });
-  let acc=0;
-  for(let i=0;i<n;i++){ acc+=diff[i]; const tr=d.rows[i]; if(tr) tr.hidden=acc>0; }
-  d.regions.forEach((r,idx)=>{
-    if(!r.tr) return;
-    const col=d.collapsed.has(idx);
-    r.tr.classList.toggle('col',col);
-    if(r.caret) r.caret.textContent=col?'▸':'▾';
-    if(r.kind==='group'){
-      let a=r.parent, hid=false;
-      while(a){ if(d.collapsed.has(a.idx)){ hid=true; break; } a=a.parent; }
-      r.tr.hidden=hid;
-    }
-  });
-}
-function toggleRegion(idx){
-  if(!doc) return;
-  if(doc.collapsed.has(idx)) doc.collapsed.delete(idx); else doc.collapsed.add(idx);
-  applyFolds();
 }
 
 /* =====================================================================
@@ -361,35 +533,41 @@ function toggleRegion(idx){
    ===================================================================== */
 async function search(){
   const q=$('#q').value.trim(); if(!q) return;
-  const b=$('#body'); $('#vh').hidden=true; cur.file=null; doc=null; showingResults=false;
-  let re, hre;
+  const b=$('#body'); VW.on=false; VW.d=null; $('#vh').hidden=true; cur.file=null; doc=null; showingResults=false; markSel();
+  let re, hre, pre;
   try{
     const rx=$('#rx').checked, fl=$('#cs').checked?'':'i', src=rx?q:reEsc(q);
-    re=new RegExp(src,fl); hre=new RegExp(src,'g'+fl);
+    re=new RegExp(src,fl); hre=new RegExp(src,'g'+fl); pre=new RegExp(src,'m'+fl);
   }catch(e){ b.innerHTML='<div class="err">Regex invalide : '+esc(e.message)+'</div>'; return; }
   const scope=$('#sc').checked?cur.dir:'';
   const list=files.filter(f=>!scope||f.path.startsWith(scope+'/'));
   const namesOnly=$('#nm').checked, results=[];
   let i=0, scanned=0, skipped=0, total=0; stopFlag=false;
+  let lastYield=performance.now(), lastNote=0;
   setBusy(true); const t0=performance.now();
   async function worker(){
     while(!stopFlag&&total<MAX_HITS){
       const f=list[i++]; if(!f) break;
-      const fr={file:f.path,hits:[],lines:new Map(),name:re.test(base(f.path))};
+      const fr={file:f.path,hits:[],lines:new Map(),name:re.test(f.name)};
       if(!namesOnly){
         try{
-          const ls=(await readText(f)).split(/\r?\n/); scanned++;
-          for(let n=0;n<ls.length&&total<MAX_HITS;n++)
-            if(re.test(ls[n])){ fr.hits.push(n+1); fr.lines.set(n+1,ls[n].trim().slice(0,300)); total++; }
+          const text=await getText(f); scanned++;
+          if(pre.test(text)){                          // un seul passage sur tout le texte : la plupart des fichiers s'arrêtent ici
+            const ls=text.split(/\r?\n/);
+            for(let n=0;n<ls.length&&total<MAX_HITS;n++)
+              if(re.test(ls[n])){ fr.hits.push(n+1); fr.lines.set(n+1,ls[n].trim().slice(0,300)); total++; }
+          }
         }catch{ skipped++; }
       }
       if(fr.hits.length||fr.name) results.push(fr);
-      if(i%10===0) b.innerHTML='<div class="note">Recherche… '+i+' / '+list.length+' fichiers · '+total+' résultat(s)</div>';
+      const now=performance.now();
+      if(now-lastNote>150){ lastNote=now; b.innerHTML='<div class="note">Recherche… '+i+' / '+list.length+' fichiers · '+total+' résultat(s)</div>'; }
+      if(now-lastYield>12){ await tick(); lastYield=performance.now(); }   // rend la main au navigateur (UI fluide)
     }
   }
   await Promise.all(Array.from({length:8},worker));
   setBusy(false);
-  results.sort((a,c)=>a.file.localeCompare(c.file,'fr',{numeric:true}));
+  results.sort((a,c)=>COLL.compare(a.file,c.file));
   lastSearch={q,hre,results,total,scanned,skipped,stopped:stopFlag,secs:((performance.now()-t0)/1000).toFixed(1)};
   showingResults=true; renderResults();
 }
@@ -441,7 +619,7 @@ function csvFiles(){
    ===================================================================== */
 $('#body').addEventListener('click',e=>{
   const t=e.target; let el;
-  if((el=t.closest('td.f.t'))||(el=t.closest('tr.grp'))){ toggleRegion(+el.closest('tr').dataset.r); return; }
+  if((el=t.closest('.vr .f.t'))||(el=t.closest('.vr.grp'))){ toggleRegion(+el.closest('.vr').dataset.r); return; }
   if((el=t.closest('[data-a]'))){
     switch(el.dataset.a){
       case 'rfold': document.querySelectorAll('.rg').forEach(g=>g.classList.add('c')); break;
@@ -454,8 +632,24 @@ $('#body').addEventListener('click',e=>{
   if((el=t.closest('.res-f .car'))){ el.closest('.rg').classList.toggle('c'); return; }
   if((el=t.closest('[data-f]'))){ openFile(el.dataset.f,+el.dataset.l||0); return; }
 });
-$('#go').onclick=search; $('#stop').onclick=()=>{stopFlag=true};
-$('#q').onkeydown=e=>{if(e.key==='Enter')search()};
+$('#body').addEventListener('scroll',()=>{
+  if(!VW.on||VW.raf) return;
+  VW.raf=requestAnimationFrame(()=>{ VW.raf=0; updateViewer(false); });
+},{passive:true});
+if(typeof ResizeObserver!=='undefined') new ResizeObserver(()=>{ if(VW.on) updateViewer(true); }).observe($('#body'));
+
+$('#go').onclick=search; $('#stop').onclick=()=>{ stopFlag=true; };
+$('#q').onkeydown=e=>{ if(e.key==='Enter') search(); };
+$('#q').oninput=()=>{ if(!$('#q').value&&showingResults) empty(); };
+
+/* cache : case « cache disque » + bouton de purge */
+$('#pc').checked=persist;
+$('#pc').onchange=async()=>{
+  persist=$('#pc').checked; try{ localStorage.setItem('persist',persist?'1':'0'); }catch{}
+  if(!persist){ putQ.length=0; try{ await idbReq('txt','readwrite',s=>{ s.clear(); }); }catch{} }
+  setInfo(persist?'Cache disque activé':'Cache disque désactivé et vidé'); setTimeout(()=>setInfo(),2500);
+};
+$('#clr').onclick=async()=>{ await clearCache(true); setInfo('Cache vidé'); setTimeout(()=>setInfo(),2500); };
 
 /* croix d'effacement (délégation) + Échap */
 document.addEventListener('input',e=>{ const i=e.target; if(i.matches('.fld input')) i.nextElementSibling.hidden=!i.value; });
@@ -467,7 +661,6 @@ document.addEventListener('click',e=>{
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'&&e.target.matches('.fld input')&&e.target.value){ e.target.value=''; e.target.dispatchEvent(new Event('input',{bubbles:true})); }
 });
-$('#q').oninput=()=>{ if(!$('#q').value&&showingResults) empty(); };
 
 /* colonne de gauche redimensionnable */
 (function(){
