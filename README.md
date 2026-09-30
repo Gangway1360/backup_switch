@@ -22,6 +22,7 @@ Le dossier des configs n'a pas besoin d'être à côté de l'outil : l'outil lit
 - Mise en page adaptée aux fenêtres étroites (colonnes empilées).
 
 ### Visionneuse
+- **Affichage virtualisé** : seules les lignes visibles existent dans la page, donc un fichier de plusieurs dizaines de milliers de lignes défile aussi fluidement qu'un petit.
 - Numéros de ligne, recherche dans le fichier avec surlignage et compteur d'occurrences.
 - Boutons **Copier** et **Télécharger**.
 - **Coloration syntaxique** : commentaires, chaînes, adresses IP, numéros, ports, mots-clés, commandes de négation (`no`, `shutdown`, `disable`…). Le numéro de `vlan` / `interface` est mis en évidence.
@@ -36,7 +37,7 @@ Le dossier des configs n'a pas besoin d'être à côté de l'outil : l'outil lit
 
 - Boutons **Tout replier** / **Tout déplier**.
 - Un saut vers une ligne (depuis les résultats de recherche) ou une recherche dans le fichier **déplie automatiquement** les sections concernées.
-- Au-delà de 40 000 lignes, la coloration et le repli sont désactivés pour préserver la fluidité.
+- Au-delà de 200 000 lignes, la coloration et le repli sont désactivés.
 
 ### Recherche plein texte
 - Sur tout l'arbre ou seulement le dossier courant.
@@ -51,6 +52,16 @@ Le dossier des configs n'a pas besoin d'être à côté de l'outil : l'outil lit
 - Croix **×** dans les champs de saisie (et `Échap`) pour les vider.
 - Thème clair / sombre automatique (selon le système).
 - Mémorisation du dernier dossier ouvert (Chrome / Edge).
+- Case **cache disque** et bouton **🧹 Cache** (voir *Performances*).
+
+## Performances
+
+- **Ouverture d'un gros dossier** : l'arborescence est énumérée sans lire les fichiers ; taille et date sont chargées à la demande, seulement pour le dossier affiché.
+- **Visionneuse virtualisée** : environ 90 lignes sont rendues à la fois, quelle que soit la taille du fichier. Replier ou déplier une section ne recrée pas la page, et l'en-tête cliqué reste à sa place à l'écran.
+- **Recherche** : chaque fichier est d'abord testé en un seul passage ; il n'est découpé en lignes que s'il contient une correspondance. Le travail est fait par petites tranches de temps pour que l'interface reste réactive, et la recherche est interruptible.
+- **Cache de contenu** : les fichiers lus sont gardés en mémoire (environ 120 Mo, les moins récents sont évincés en premier) et revalidés par taille et date. Les recherches suivantes ne relisent donc plus le partage. Un survol prolongé d'un fichier le précharge avant le clic.
+- **Cache disque (optionnel, désactivé par défaut)** : la case *cache disque* conserve aussi le contenu dans IndexedDB, ce qui accélère les recherches d'une session à l'autre. Comme les configs contiennent des secrets, active-le seulement si ta politique de sécurité l'autorise. Décocher la case ou cliquer sur **🧹 Cache** efface tout.
+- Listes de fichiers longues : rendu différé hors écran (`content-visibility`), tri et comparaison de noms pré-calculés.
 
 ## Compatibilité navigateurs
 
@@ -74,6 +85,7 @@ Les fichiers sont décodés en UTF-8, avec repli automatique sur Windows-1252.
 - **Lecture seule** : aucune modification des fichiers.
 - Les fichiers **binaires** ou de plus de **8 Mo** sont ignorés (affichage comme recherche).
 - La recherche est plafonnée à **2 000 résultats**.
+- La visionneuse étant virtualisée, `Ctrl+F` du navigateur ne voit que les lignes affichées : utilise le champ **Chercher dans le fichier**. La sélection à la souris fonctionne sur les lignes affichées ; pour tout récupérer, utilise **Copier**.
 - Chrome / Edge refusent de sélectionner la **racine d'un lecteur** (`Z:\`) ou certains dossiers système : choisis un sous-répertoire (`Z:\configs`).
 - Sur un partage réseau, la première recherche relit les fichiers via SMB et peut prendre quelques secondes.
 - La détection du format s'appuie sur les syntaxes ProCurve et OmniSwitch courantes. Une syntaxe atypique se lit normalement mais peut ne pas bénéficier de tous les regroupements de sections.
@@ -100,7 +112,7 @@ location /configs/ {
 ## Sécurité et vie privée
 
 - Aucune requête réseau : ni analytics, ni CDN, ni police externe.
-- Les données restent dans le navigateur. Seuls le dernier dossier (IndexedDB) et la largeur de la colonne (localStorage) sont mémorisés.
+- Les données restent dans le navigateur. Par défaut, seuls le dernier dossier (IndexedDB) et la largeur de la colonne (localStorage) sont mémorisés. Le contenu des fichiers n'est conservé sur disque que si tu actives *cache disque*.
 - Le contenu des fichiers est toujours échappé avant affichage.
 - Les exports CSV neutralisent les débuts de cellule pouvant être interprétés comme des formules par Excel (`=`, `+`, `-`, `@`).
 - Les configs contiennent souvent des secrets (communautés SNMP, mots de passe, clés RADIUS) : pense-y avant de partager une capture ou un export.
@@ -111,9 +123,9 @@ location /configs/ {
 config_browser/
 ├── index.html   # structure de la page
 ├── style.css    # thème clair/sombre, coloration, sections repliables, résultats
-└── app.js       # sources de fichiers, analyse, coloration, repli, recherche, CSV
+└── app.js       # sources de fichiers, caches, analyse, coloration, repli, visionneuse virtualisée, recherche, CSV
 ```
 
-Dans `app.js`, les grandes parties sont, dans l'ordre : index et sources de fichiers, liste, lecture, **analyse** (`detectVendor`, `tokenize`, `computeFolds`), visionneuse, **recherche** et exports CSV, événements globaux.
+Dans `app.js`, les grandes parties sont, dans l'ordre : index et sources de fichiers, **caches** (`getText`), liste, **analyse** (`detectVendor`, `tokenize`, `computeFolds`), **visionneuse virtualisée** (`rebuildVis`, `renderRows`, `updateViewer`), **recherche** et exports CSV, événements globaux.
 
 Pour ajouter un constructeur, les points d'entrée sont `detectVendor()` (reconnaissance), `computeFolds()` (règles de repli) et `tokenize()` (coloration).
