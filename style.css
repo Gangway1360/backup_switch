@@ -34,11 +34,6 @@ main{flex:1;display:flex;min-height:0}
 #body{flex:1;overflow:auto}
 .empty{color:var(--mu);padding:60px 20px;text-align:center}
 .empty button{margin:6px}
-table.code{border-collapse:collapse;width:100%;font:12.5px/1.5 Consolas,Menlo,monospace}
-table.code td{padding:0 10px;vertical-align:top}
-table.code td.l{color:var(--mu);text-align:right;user-select:none;background:var(--ln);position:sticky;left:0;width:1%;white-space:nowrap;border-right:1px solid var(--bd)}
-table.code td.c{white-space:pre}
-tr.flash td.c{background:var(--hl)}
 mark{background:var(--hl);color:inherit;border-radius:2px}
 .res-f{padding:6px 14px;background:var(--ln);border-top:1px solid var(--bd);border-bottom:1px solid var(--bd);font-weight:600;cursor:pointer;word-break:break-all}
 .res-h{display:flex;gap:10px;padding:2px 14px;cursor:pointer;font:12.5px Consolas,Menlo,monospace}
@@ -62,16 +57,6 @@ mark{background:var(--hl);color:inherit;border-radius:2px}
 .c-id{color:var(--c-id);font-weight:700}
 
 /* ---- sections repliables ---- */
-table.code td.f{position:sticky;left:0;width:18px;min-width:18px;padding:0;text-align:center;background:var(--ln);color:var(--mu);user-select:none}
-table.code td.f.t{cursor:pointer}
-table.code td.f.t:hover{color:var(--ac)}
-table.code td.l{left:18px}
-.fd{display:none;margin-left:10px;color:var(--mu);font-style:italic}
-tr.col .fd{display:inline}
-tr.sec td.c{font-weight:700;background:var(--ln)}
-tr.grp td.c{background:var(--ln);color:var(--mu);cursor:pointer;font-style:italic}
-tr.grp td.c b{color:var(--fg);font-style:normal}
-tr.grp:hover td.c{background:var(--hv)}
 .tag{display:inline-block;border:1px solid var(--bd);border-radius:10px;padding:0 8px;font-size:12px;color:var(--mu);white-space:nowrap}
 
 /* ---- résultats de recherche groupés ---- */
@@ -83,3 +68,26 @@ tr.grp:hover td.c{background:var(--hv)}
 .res-f .nm{flex:1;min-width:0}
 .cnt{background:var(--ac);color:#fff;border-radius:10px;padding:0 8px;font-size:12px;font-weight:600}
 .rg.c .rb{display:none}
+
+/* ---- visionneuse virtualisée : lignes de hauteur fixe, seules les lignes visibles existent dans le DOM ---- */
+#body{overflow-anchor:none}
+.vs{position:relative}
+.vw{position:absolute;left:0;right:0;top:0}
+.vw,.vprobe{font:12.5px/19px Consolas,Menlo,monospace}
+.vprobe{position:absolute;left:0;top:0;visibility:hidden;white-space:pre}
+.vr{display:flex;height:19px;line-height:19px;white-space:pre}
+.vr .f{position:sticky;left:0;z-index:1;flex:none;width:18px;text-align:center;background:var(--ln);color:var(--mu);user-select:none}
+.vr .f.t{cursor:pointer}
+.vr .f.t:hover{color:var(--ac)}
+.vr .l{position:sticky;left:18px;z-index:1;flex:none;width:64px;padding:0 10px;text-align:right;background:var(--ln);color:var(--mu);border-right:1px solid var(--bd);user-select:none}
+.vr .c{flex:none;padding:0 10px}
+.vr.flash{background:var(--hl)}
+.vr.sec{background:var(--ln);font-weight:700}
+.vr.grp{background:var(--ln);color:var(--mu);cursor:pointer;font-style:italic}
+.vr.grp b{color:var(--fg);font-style:normal}
+.vr.grp:hover{background:var(--hv)}
+.fd{margin-left:10px;color:var(--mu);font-style:italic;font-weight:400}
+
+/* ---- listes longues : le navigateur saute le rendu de ce qui est hors écran ---- */
+.row{content-visibility:auto;contain-intrinsic-size:auto 46px}
+.rg{content-visibility:auto;contain-intrinsic-size:auto 120px}
