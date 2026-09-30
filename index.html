@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Explorateur de configs</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M6 14a4 4 0 0 1 4-4h14l6 6h24a4 4 0 0 1 4 4v30a4 4 0 0 1-4 4H10a4 4 0 0 1-4-4z' fill='%232563eb'/%3E%3Cpath d='M6 26h52v22a4 4 0 0 1-4 4H10a4 4 0 0 1-4-4z' fill='%2360a5fa'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<header>
+  <h1>📂 Configs</h1>
+  <button id="pick">Choisir un dossier…</button>
+  <button id="reopen" class="sec" hidden></button>
+  <input type="file" id="fallback" webkitdirectory multiple hidden>
+  <span id="info" style="color:var(--mu);font-size:12px"></span>
+  <span style="flex:1"></span>
+  <span class="fld"><input type="text" id="q" placeholder="Recherche plein texte…" disabled><button class="x" type="button" title="Effacer" hidden>×</button></span>
+  <label><input type="checkbox" id="rx"> regex</label>
+  <label><input type="checkbox" id="cs"> casse</label>
+  <label><input type="checkbox" id="nm"> noms seuls</label>
+  <label><input type="checkbox" id="sc" checked> dossier courant</label>
+  <button id="go" disabled>Chercher</button>
+  <button id="stop" class="sec" hidden>Arrêter</button>
+</header>
+<main>
+  <section id="side">
+    <div id="crumbs"></div>
+    <span class="fld"><input type="text" id="filter" placeholder="Filtrer les fichiers du dossier…"><button class="x" type="button" title="Effacer" hidden>×</button></span>
+    <div id="list"></div>
+  </section>
+  <div id="resizer" title="Glisser pour redimensionner"></div>
+  <section id="view">
+    <div id="vh" hidden></div>
+    <div id="body"></div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body></html>
