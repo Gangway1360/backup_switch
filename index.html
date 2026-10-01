@@ -11,9 +11,6 @@
   <button id="reopen" class="sec" hidden></button>
   <input type="file" id="fallback" webkitdirectory multiple hidden>
   <span id="info" style="color:var(--mu);font-size:12px"></span>
-  <label title="Conserve le contenu des fichiers dans le navigateur (IndexedDB) pour accélérer les recherches. Désactivé par défaut : les configs contiennent des secrets."><input type="checkbox" id="pc"> cache disque</label>
-  <button id="clr" class="sec" title="Vider le cache de contenu (mémoire + disque)">🧹 Cache</button>
-  <button id="db" class="sec" disabled title="Synthèse du parc : modèles, ports, PoE, firmware, VLAN">📊 Tableau de bord</button>
   <span style="flex:1"></span>
   <span class="fld"><input type="text" id="q" placeholder="Recherche plein texte…" disabled><button class="x" type="button" title="Effacer" hidden>×</button></span>
   <label><input type="checkbox" id="rx"> regex</label>
@@ -35,22 +32,5 @@
     <div id="body"></div>
   </section>
 </main>
-<dialog id="cat">
-  <h3>Catalogue matériel</h3>
-  <p class="hint">Les configs ne contiennent pas toujours le modèle exact, le nombre de ports ni le PoE. Ce catalogue (enregistré dans ton navigateur) complète l'analyse.<br>
-  <b>models</b> : par référence produit (ex. <code>JL256A</code>) → <code>{ "name": "…", "ports": 48, "poe": true }</code>.<br>
-  <b>rules</b> : par expression régulière sur le hostname et/ou le chemin du fichier (<code>"on": "host" | "file"</code>, sinon les deux) → <code>{ "match": "^SW-IDF", "name": "OS6860E-P48", "ports": 48, "poe": true }</code>.</p>
-  <textarea id="cat-t" spellcheck="false"></textarea>
-  <div class="err" id="cat-e"></div>
-  <div class="dact">
-    <button id="cat-unk" class="sec" title="Ajoute au catalogue une entrée vide par référence produit détectée mais non identifiée">Ajouter les références non identifiées</button>
-    <button id="cat-imp" class="sec">Importer…</button>
-    <button id="cat-exp" class="sec">Exporter</button>
-    <span style="flex:1"></span>
-    <button id="cat-cancel" class="sec">Annuler</button>
-    <button id="cat-save">Enregistrer</button>
-  </div>
-  <input type="file" id="cat-file" accept=".json,application/json" hidden>
-</dialog>
 <script src="app.js"></script>
 </body></html>
