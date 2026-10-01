@@ -41,13 +41,14 @@ function build(list,name){
   }
   tree.forEach(n=>{ n.dirs=[...n.d].sort((a,b)=>COLL.compare(base(a),base(b))); n.f.sort((a,b)=>COLL.compare(a.name,b.name)); });
   cur={dir:'',file:null}; doc=null; lastSearch=null; renderedDir=null;
-  setInfo(); $('#q').disabled=false; $('#go').disabled=false;
+  rawCache.clear(); dash.raws=[]; dash.meta=null; dash.filter=null; dash.on=false;
+  setInfo(); $('#q').disabled=false; $('#go').disabled=false; $('#db').disabled=false;
   clearFilter(); renderList(); empty();
   pruneCache();
 }
 function setInfo(t){ $('#info').textContent=t!=null?t:(rootName?rootName+' — '+files.length+' fichiers':''); }
-function empty(){ VW.on=false; VW.d=null; showingResults=false; $('#vh').hidden=true; $('#body').innerHTML='<div class="empty">Sélectionne un fichier ou lance une recherche.</div>'; }
-function setBusy(on){ busy=on; $('#go').hidden=on; $('#stop').hidden=!on; }
+function empty(){ dash.on=false; VW.on=false; VW.d=null; showingResults=false; $('#vh').hidden=true; $('#body').innerHTML='<div class="empty">Sélectionne un fichier ou lance une recherche.</div>'; }
+function setBusy(on){ busy=on; $('#go').hidden=on; $('#stop').hidden=!on; $('#db').disabled=on; }
 
 /* ---------- sources : File System Access API (Chrome/Edge) ou <input webkitdirectory> (Firefox) ---------- */
 /* L'énumération ne fait AUCUN stat : taille/date sont chargées à la demande (voir fillMeta). */
@@ -502,7 +503,7 @@ async function openFile(path,line){
     let d=doc;
     if(!d||d.path!==path){ const text=await getText(f); if(tok!==openSeq) return; d=analyze(path,text,f); doc=d; }
     d.rg=null; d.matchLines=[]; d.matchCount=0; d.flash=line>0?line-1:-1;
-    showingResults=false; cur.file=path;
+    showingResults=false; dash.on=false; cur.file=path;
     if(renderedDir!==parent(path)){ cur.dir=parent(path); renderList(); } else markSel();
     const vh=$('#vh'); vh.hidden=false;
     vh.innerHTML='<span class="t">'+esc(path)+'</span><span class="tag">'+VN[d.vendor]+'</span>'+
@@ -531,9 +532,33 @@ async function openFile(path,line){
 /* =====================================================================
    Recherche plein texte : regroupement par fichier, compteurs, CSV
    ===================================================================== */
+/* ---------- barre de progression commune (recherche, tableau de bord) ---------- */
+function progressHtml(label,done,total,t0,extra,curFile){
+  const now=performance.now(), secs=(now-t0)/1000, pct=total?Math.min(100,done/total*100):0;
+  const rate=secs>0.2?done/secs:0, eta=rate>0?Math.max(0,(total-done)/rate):null;
+  const fmtS=s=>s<60?Math.ceil(s)+' s':Math.floor(s/60)+' min '+Math.round(s%60)+' s';
+  return '<div class="prog"><div class="pbar"><i style="width:'+pct.toFixed(1)+'%"></i></div>'+
+    '<div class="prow"><b>'+done+' / '+total+'</b> fichiers ('+pct.toFixed(0)+' %)'+(extra?' · '+extra:'')+
+    (rate>1?' · '+Math.round(rate)+' fichiers/s':'')+(eta!=null&&done<total?' · reste ≈ '+fmtS(eta):'')+
+    '<span style="flex:1"></span><button class="sec" data-a="pstop">Arrêter</button></div>'+
+    (curFile?'<div class="pf" title="'+esc(curFile)+'">'+esc(curFile)+'</div>':'')+'</div>';
+}
+function makeTicker(label,b,getTotal,skipRender){
+  let lastNote=0, lastFile='', lastExtra='';
+  return (done,extra,file)=>{
+    if(file) lastFile=file; if(extra!=null) lastExtra=extra;
+    const now=performance.now();
+    if(now-lastNote<150&&done<getTotal()) return;
+    lastNote=now;
+    if(skipRender&&skipRender()) return;             // ex. actualisation du tableau de bord : l'aperçu périodique gère déjà l'affichage
+    b.innerHTML=progressHtml(label,done,getTotal(),t0Ref.t,lastExtra,lastFile);
+  };
+}
+const t0Ref={t:0};
+
 async function search(){
   const q=$('#q').value.trim(); if(!q) return;
-  const b=$('#body'); VW.on=false; VW.d=null; $('#vh').hidden=true; cur.file=null; doc=null; showingResults=false; markSel();
+  const b=$('#body'); dash.on=false; VW.on=false; VW.d=null; $('#vh').hidden=true; cur.file=null; doc=null; showingResults=false; markSel();
   let re, hre, pre;
   try{
     const rx=$('#rx').checked, fl=$('#cs').checked?'':'i', src=rx?q:reEsc(q);
@@ -543,8 +568,9 @@ async function search(){
   const list=files.filter(f=>!scope||f.path.startsWith(scope+'/'));
   const namesOnly=$('#nm').checked, results=[];
   let i=0, scanned=0, skipped=0, total=0; stopFlag=false;
-  let lastYield=performance.now(), lastNote=0;
-  setBusy(true); const t0=performance.now();
+  let lastYield=performance.now();
+  setBusy(true); t0Ref.t=performance.now();
+  const tick1=makeTicker('Recherche',b,()=>list.length);
   async function worker(){
     while(!stopFlag&&total<MAX_HITS){
       const f=list[i++]; if(!f) break;
@@ -560,15 +586,15 @@ async function search(){
         }catch{ skipped++; }
       }
       if(fr.hits.length||fr.name) results.push(fr);
+      tick1(i,total+' résultat(s)',f.path);
       const now=performance.now();
-      if(now-lastNote>150){ lastNote=now; b.innerHTML='<div class="note">Recherche… '+i+' / '+list.length+' fichiers · '+total+' résultat(s)</div>'; }
       if(now-lastYield>12){ await tick(); lastYield=performance.now(); }   // rend la main au navigateur (UI fluide)
     }
   }
   await Promise.all(Array.from({length:8},worker));
   setBusy(false);
   results.sort((a,c)=>COLL.compare(a.file,c.file));
-  lastSearch={q,hre,results,total,scanned,skipped,stopped:stopFlag,secs:((performance.now()-t0)/1000).toFixed(1)};
+  lastSearch={q,hre,results,total,scanned,skipped,stopped:stopFlag,secs:((performance.now()-t0Ref.t)/1000).toFixed(1)};
   showingResults=true; renderResults();
 }
 function renderResults(){
@@ -615,6 +641,354 @@ function csvFiles(){
 }
 
 /* =====================================================================
+   Tableau de bord : synthèse du parc (modèles, ports, PoE, firmware, VLAN)
+   - extraction légère par fichier (mise en cache), agrégation recalculée à la volée
+   - le modèle / nombre de ports / PoE viennent, dans l'ordre : du catalogue utilisateur,
+     de la table intégrée, des règles (hostname/fichier), puis de l'analyse de la config
+   ===================================================================== */
+/* Références produit courantes (intégrées, à vérifier ; le catalogue utilisateur est prioritaire).
+   « ports » = ports d'accès (classe 24/48), hors uplinks. */
+const BUILTIN={
+  'J9776A':{name:'Aruba 2530-24G',ports:24,poe:false},          'J9775A':{name:'Aruba 2530-48G',ports:48,poe:false},
+  'J9773A':{name:'Aruba 2530-24G-PoE+',ports:24,poe:true},      'J9772A':{name:'Aruba 2530-48G-PoE+',ports:48,poe:true},
+  'J9726A':{name:'Aruba 2920-24G',ports:24,poe:false},          'J9728A':{name:'Aruba 2920-48G',ports:48,poe:false},
+  'J9727A':{name:'Aruba 2920-24G-PoE+',ports:24,poe:true},      'J9729A':{name:'Aruba 2920-48G-PoE+',ports:48,poe:true},
+  'JL253A':{name:'Aruba 2930F-24G-4SFP+',ports:24,poe:false},   'JL254A':{name:'Aruba 2930F-48G-4SFP+',ports:48,poe:false},
+  'JL255A':{name:'Aruba 2930F-24G-PoE+-4SFP+',ports:24,poe:true},'JL256A':{name:'Aruba 2930F-48G-PoE+-4SFP+',ports:48,poe:true},
+  'J9021A':{name:'HP 2810-24G',ports:24,poe:false},             'J9022A':{name:'HP 2810-48G',ports:48,poe:false}
+};
+const PORT_RE=/^[A-Za-z]{0,2}\d+(?:\/\d+){0,2}$/;
+const POE_PC=/^\s*(?:no\s+)?(?:power-over-ethernet|poe-[a-z-]+)\b/i;
+const PORT_CLASSES=[8,12,16,24,48];
+const portClass=n=>{ for(let i=PORT_CLASSES.length-1;i>=0;i--){ const c=PORT_CLASSES[i]; if(c<=n&&n-c<=4) return c; } return n; };   // 52 -> 48, 26 -> 24, 10 -> 8…
+const FACET_NAME={vendor:'Constructeur',model:'Modèle',ports:'Ports',poe:'PoE',fw:'Firmware',kind:'Topologie',vlan:'VLAN'};
+const POE_COL={'PoE':'var(--ac)','Non PoE':'var(--mu)','Indéterminé':'var(--c-ip)'};
+const rawCache=new Map();
+const dash={raws:[],meta:null,dedupe:true,filter:null,devs:[],stats:null,on:false,unknown:new Set()};
+
+function expandPorts(spec){
+  const out=[];
+  for(const part of spec.split(',')){
+    const p=part.trim(); if(!p) continue;
+    const m=/^(.*?)(\d+)-(?:\1)?(\d+)$/.exec(p);
+    if(m&&+m[3]>=+m[2]&&+m[3]-+m[2]<300){ for(let k=+m[2];k<=+m[3];k++) out.push(m[1]+k); }
+    else out.push(p);
+  }
+  return out;
+}
+/* extraction brute d'un fichier : identité, références produit, ports, VLAN, indices PoE */
+function extractDevice(lines,vendor,path){
+  const D={file:path,vendor,host:'',code:'',fw:'',members:new Map(),vc:new Set(),modules:[],ports:new Map(),vlans:new Map(),ips:[],poeEv:false,mtime:0};
+  const addPorts=spec=>{
+    for(const p of expandPorts(spec)){
+      if(!PORT_RE.test(p)) continue;                    // ignore Trk1, lacp…
+      const u=p.includes('/')?p.split('/')[0]:'1';      // unité = membre de stack / châssis de VC
+      let s=D.ports.get(u); if(!s){ s=new Set(); D.ports.set(u,s); }
+      s.add(p);
+    }
+  };
+  let m;
+  if(vendor==='os'){
+    for(const raw of lines){
+      const l=raw.trim(); if(!l||l[0]==='!') continue;
+      if((m=/^system name\s+"?([^"]*?)"?\s*$/i.exec(l))){ D.host=m[1]; continue; }
+      if((m=/^virtual-chassis\s+(?:configured-chassis-id|chassis-id)\s+(\d+)/i.exec(l))){ D.vc.add(m[1]); continue; }
+      if(/^lanpower\b/i.test(l)){ D.poeEv=true; continue; }
+      if((m=/^vlan\s+(\d+)(?:-(\d+))?\b(.*)$/i.exec(l))){
+        const a=+m[1], b=m[2]?+m[2]:a, rest=m[3];
+        if(b>=a&&b-a<=4094){
+          const nm=/\bname\s+(?:"([^"]*)"|(\S+))/i.exec(rest)||[], name=nm[1]!=null?nm[1]:(nm[2]||'');
+          for(let id=a;id<=b;id++) if(!D.vlans.has(id)||name) D.vlans.set(id,name||D.vlans.get(id)||'');
+        }
+        let x;
+        if((x=/\bmembers\s+port\s+(\S+)/i.exec(rest))) addPorts(x[1]);
+        else if((x=/\bport\s+default\s+(\S+)/i.exec(rest))) addPorts(x[1]);
+        else if((x=/\b802\.1q\s+(\S+)/i.exec(rest))) addPorts(x[1]);
+        continue;
+      }
+      if(/^ip interface\b/i.test(l)){ const a=/\baddress\s+(\d+(?:\.\d+){3})/i.exec(l); if(a) D.ips.push(a[1]); continue; }
+      if((m=/^interfaces\s+(\S+)/i.exec(l))) addPorts(m[1]);
+    }
+  } else {
+    let ctx=null;
+    for(const l of lines){
+      if(!l.trim()) continue;
+      if(/^\s*[;!#]/.test(l)){
+        if((m=/^;\s*(?:hp\s+)?(\S+)\s+Configuration Editor;\s*Created on release\s+#?(\S+)/i.exec(l))){ D.code=m[1].toUpperCase(); D.fw=m[2]; }
+        continue;
+      }
+      if(POE_PC.test(l)) D.poeEv=true;
+      if(/^\S/.test(l)){
+        ctx=null;
+        if((m=/^hostname\s+"?([^"]*?)"?\s*$/i.exec(l))) D.host=m[1];
+        else if((m=/^vlan\s+(\d+)\s*$/i.exec(l))){ ctx={k:'vlan',id:+m[1]}; if(!D.vlans.has(ctx.id)) D.vlans.set(ctx.id,''); }
+        else if((m=/^interface\s+(\S+)/i.exec(l))){ ctx={k:'if'}; if(!/^vlan/i.test(m[1])) addPorts(m[1]); }
+        else if(/^stacking\s*$/i.test(l)) ctx={k:'stack'};
+        else if((m=/^stacking\s+member\s+(\d+)\s+type\s+"?([^"\s]+)"?/i.exec(l))) D.members.set(m[1],m[2].toUpperCase());
+        else if((m=/^module\s+(\S+)\s+type\s+(\S+)/i.exec(l))) D.modules.push(m[2].toUpperCase());
+      } else if(ctx){
+        const t=l.trim(); let x;
+        if(ctx.k==='vlan'){
+          if((x=/^name\s+"?([^"]*?)"?\s*$/i.exec(t))) D.vlans.set(ctx.id,x[1]);
+          else if((x=/^(?:untagged|tagged|forbid)\s+(.+)$/i.exec(t))) addPorts(x[1]);
+          else if((x=/^ip address\s+(\d+(?:\.\d+){3})\s/i.exec(t+' '))) D.ips.push(x[1]);
+        } else if(ctx.k==='stack'){
+          if((x=/^member\s+(\d+)\s+type\s+"?([^"\s]+)"?/i.exec(t))) D.members.set(x[1],x[2].toUpperCase());
+        }
+      }
+    }
+  }
+  return D;
+}
+
+/* ---------- catalogue utilisateur (localStorage) ---------- */
+const CAT_DEFAULT='{\n  "models": {},\n  "rules": []\n}';
+function parseCatalog(text){
+  let o; try{ o=JSON.parse(text); }catch(e){ throw new Error('JSON invalide : '+e.message); }
+  if(!o||typeof o!=='object'||Array.isArray(o)) throw new Error('La racine doit être un objet { "models": {…}, "rules": […] }');
+  const c={models:{},rules:[]};
+  if(o.models!=null){
+    if(typeof o.models!=='object'||Array.isArray(o.models)) throw new Error('« models » doit être un objet');
+    for(const [k,v] of Object.entries(o.models)){ if(v==null||typeof v!=='object'||Array.isArray(v)) throw new Error('models.'+k+' doit être un objet'); c.models[k.toUpperCase()]=v; }
+  }
+  if(o.rules!=null){
+    if(!Array.isArray(o.rules)) throw new Error('« rules » doit être un tableau');
+    o.rules.forEach((r,i)=>{
+      if(!r||typeof r.match!=='string') throw new Error('rules['+i+'] : « match » (texte) requis');
+      try{ c.rules.push({...r,re:new RegExp(r.match,'i')}); }catch(e){ throw new Error('rules['+i+'] : regex invalide ('+e.message+')'); }
+    });
+  }
+  return c;
+}
+let catalogText=CAT_DEFAULT; try{ catalogText=localStorage.getItem('catalog')||CAT_DEFAULT; }catch{}
+let catalog={models:{},rules:[]}; try{ catalog=parseCatalog(catalogText); }catch{}
+
+/* identification d'une unité (membre de stack / châssis) */
+function unitInfo(d,u,nUnits){
+  const code=u.code; let m=null, src='';
+  if(code&&catalog.models[code]){ m=catalog.models[code]; src='catalogue'; }
+  else if(code&&BUILTIN[code]){ m=BUILTIN[code]; src='intégré'; }
+  else{
+    const subj=d.host+' '+d.file;
+    for(const r of catalog.rules){ if(r.re.test(r.on==='file'?d.file:r.on==='host'?d.host:subj)){ m=r; src='règle'; break; } }
+  }
+  const known=!!(m&&(m.name||m.ports!=null||m.poe!=null));
+  const name=(m&&m.name)||code||'Modèle inconnu';
+  let ports=null, portsSrc='';
+  if(m&&m.ports!=null&&m.ports!==''){ ports=+m.ports; portsSrc=src; }
+  else if(u.reliable&&u.est>0){ ports=portClass(u.est); portsSrc='estimé'; }
+  let poe=null;
+  if(m&&m.poe!=null) poe=!!m.poe; else if(/poe/i.test(name)) poe=true; else if(d.poeEv&&nUnits===1) poe=true;
+  return {id:u.id,code,name,ports,portsSrc,poe,known,src,est:u.est};
+}
+function unitsOf(d){
+  const ids=new Set([...d.ports.keys(),...d.members.keys(),...d.vc]); if(!ids.size) ids.add('1');
+  const sorted=[...ids].sort((a,b)=>a-b), first=sorted[0];
+  return sorted.map(id=>{
+    let code=d.members.get(id)||'';
+    if(!code&&!d.members.size&&id===first) code=d.code||d.modules[0]||'';
+    const est=d.ports.has(id)?d.ports.get(id).size:0;
+    return unitInfo(d,{id,code,est,reliable:d.vendor!=='os'&&est>0},sorted.length);
+  });
+}
+
+/* ---------- agrégation ---------- */
+function addTo(map,label,dev){ let o=map.get(label); if(!o){ o={n:0,devs:new Set()}; map.set(label,o); } o.n++; o.devs.add(dev); }
+function computeStats(devs){
+  const F={vendor:new Map(),model:new Map(),ports:new Map(),poe:new Map(),fw:new Map(),kind:new Map(),vlan:new Map()};
+  const S={devices:devs.length,units:0,portsTotal:0,portsUnknownUnits:0,unknownUnits:0,poeYes:0,poeUnk:0,F,vname:new Map(),unknown:new Set()};
+  for(const d of devs){
+    const U=unitsOf(d); d.U=U;
+    d.vendorLabel=VN[d.vendor]; d.fwLabel=d.fw||'Inconnu';
+    d.kind=U.length>1?(d.vendor==='os'?'Virtual Chassis':'Stack'):'Autonome';
+    addTo(F.vendor,d.vendorLabel,d); addTo(F.fw,d.fwLabel,d); addTo(F.kind,d.kind,d);
+    const names=new Map(), poes=new Map();
+    for(const u of U){
+      S.units++;
+      addTo(F.model,u.name,d); names.set(u.name,(names.get(u.name)||0)+1);
+      u.portsLabel=u.ports!=null?u.ports+' ports':'Non renseigné'; addTo(F.ports,u.portsLabel,d);
+      if(u.ports!=null) S.portsTotal+=u.ports; else S.portsUnknownUnits++;
+      u.poeLabel=u.poe===true?'PoE':u.poe===false?'Non PoE':'Indéterminé'; addTo(F.poe,u.poeLabel,d);
+      poes.set(u.poeLabel,(poes.get(u.poeLabel)||0)+1);
+      if(u.poe===true) S.poeYes++; else if(u.poe===null) S.poeUnk++;
+      if(!u.known){ S.unknownUnits++; if(u.code) S.unknown.add(u.code); }
+    }
+    for(const [id,nm] of d.vlans){ addTo(F.vlan,String(id),d); if(nm&&!S.vname.has(id)) S.vname.set(id,nm); }
+    d.modelTxt=[...names].map(([n,c])=>(c>1?c+'× ':'')+n).join(' + ');
+    const known=U.filter(u=>u.ports!=null), sum=known.reduce((a,u)=>a+u.ports,0);
+    d.portsTxt=known.length?(known.some(u=>u.portsSrc==='estimé')?'~':'')+sum+(known.length<U.length?'+?':''):'?';
+    d.poeTxt=poes.size===1?[...poes.keys()][0]:[...poes].map(([k,c])=>c+' '+k).join(' / ');
+  }
+  return S;
+}
+
+/* ---------- analyse du dossier ---------- */
+async function showDashboard(){
+  const b=$('#body'), refreshing=dash.on;
+  VW.on=false; VW.d=null; $('#vh').hidden=true; cur.file=null; doc=null; showingResults=false; markSel();
+  if(!refreshing) dash.on=false;                   // 1er affichage : page d'attente, puis aperçus. Actualisation : le tableau reste à l'écran.
+  const scope=$('#sc').checked?cur.dir:'';
+  const list=files.filter(f=>!scope||f.path.startsWith(scope+'/'));
+  const raws=[]; let i=0, done=0, skipped=0, none=0; stopFlag=false, gotPartial=false;
+  let lastYield=performance.now(), lastPartial=0;
+  const CACHED=list.filter(f=>f.size!=null&&rawCache.has(rootName+'|'+f.path+'|'+f.size+'|'+f.mtime)).length;
+  setBusy(true); t0Ref.t=performance.now();
+  const tick1=makeTicker('Analyse',b,()=>list.length,()=>refreshing||gotPartial);   // la barre texte s'efface dès qu'un aperçu du tableau existe
+  async function worker(){
+    while(!stopFlag){
+      const f=list[i++]; if(!f) break;
+      try{
+        const text=await getText(f);
+        const key=rootName+'|'+f.path+'|'+f.size+'|'+f.mtime;
+        let D=rawCache.get(key);
+        if(!D){ const lines=text.split(/\r?\n/); D=extractDevice(lines,detectVendor(lines),f.path); rawCache.set(key,D); }
+        D.mtime=f.mtime;
+        if(D.host||D.ports.size||D.vlans.size) raws.push(D); else none++;
+      }catch{ skipped++; }
+      done++;
+      tick1(done,done+' analysé(s)',f.path);
+      const now=performance.now();
+      const due=!lastPartial?900:4500;               // 1er aperçu rapide (le tableau apparaît vite), puis cadence normale
+      if(now-lastPartial>due&&raws.length){
+        lastPartial=now; gotPartial=true;
+        dash.raws=raws.slice(); dash.meta={total:list.length,skipped,none,stopped:stopFlag,partial:true};
+        renderDash(progressHtml('Analyse',done,list.length,t0Ref.t,done+' analysé(s)',f.path));
+      }
+      if(now-lastYield>12){ await tick(); lastYield=performance.now(); }
+    }
+  }
+  if(!refreshing&&CACHED>0&&CACHED<list.length) b.innerHTML='<div class="note">'+CACHED+' / '+list.length+' fichiers déjà en cache…</div>';
+  await Promise.all(Array.from({length:6},worker));
+  setBusy(false);
+  dash.raws=raws; dash.meta={total:list.length,skipped,none,stopped:stopFlag}; dash.filter=null;
+  renderDash();
+}
+
+/* ---------- rendu ---------- */
+const byCount=(a,b)=>b[1].n-a[1].n||COLL.compare(a[0],b[0]);
+function barsHtml(facet,entries,sel){
+  const max=Math.max(1,...entries.map(e=>e[1].n));
+  return entries.map(([label,o,disp])=>'<div class="bar'+(sel&&sel.f===facet&&sel.v===label?' on':'')+'" data-facet="'+facet+'" data-val="'+esc(label)+'" title="'+esc(disp||label)+'"><span class="lbl">'+esc(disp||label)+'</span><span class="trk"><i style="width:'+(o.n/max*100).toFixed(1)+'%"></i></span><span class="n">'+o.n+'</span></div>').join('')||'<div class="hint">—</div>';
+}
+function renderDash(progress){
+  const b=$('#body'), st=b.scrollTop, hadDevices=!!(dash.stats&&dash.stats.devices);
+  VW.on=false; showingResults=false; dash.on=true;
+  let devs=dash.raws;
+  if(dash.dedupe){                                                   // une seule config par équipement : la plus récente
+    const m=new Map();
+    for(const d of devs){
+      const k=d.host?d.vendor+'|'+d.host.toLowerCase():'f|'+d.file, o=m.get(k);
+      if(!o||d.mtime>o.mtime||(d.mtime===o.mtime&&d.file>o.file)) m.set(k,d);
+    }
+    devs=[...m.values()];
+  }
+  const S=computeStats(devs);
+  if(!S.devices&&progress&&hadDevices){ b.scrollTop=st; return; }   // actualisation : le tableau précédent reste affiché le temps du 1er aperçu
+  dash.devs=devs; dash.stats=S; dash.unknown=S.unknown;
+  const M=dash.meta||{}, F=S.F;
+  if(dash.filter&&dash.filter.f!=='all'&&!(F[dash.filter.f]&&F[dash.filter.f].has(dash.filter.v))) dash.filter=null;
+  const sel=progress?null:dash.filter;
+  let h=progress||'';
+  if(!progress) h+='<div class="dbar"><label><input type="checkbox" id="dd"'+(dash.dedupe?' checked':'')+'> dernière sauvegarde par équipement</label><span class="m">'+
+    dash.raws.length+' configuration(s) analysée(s)'+(M.none?' · '+M.none+' sans configuration reconnue':'')+(M.skipped?' · '+M.skipped+' ignorée(s)':'')+(M.stopped?' · analyse interrompue':'')+
+    '</span><span style="flex:1"></span><button class="sec" data-a="dcat">Catalogue matériel…</button><button class="sec" data-a="dcsv">Export CSV</button><button class="sec" data-a="dref">Actualiser</button></div>';
+  if(!S.devices){
+    b.innerHTML=h+'<div class="note">'+(progress?'En attente des premiers résultats…':'Aucune configuration reconnue dans ce dossier (ProCurve / OmniSwitch).')+'</div>';
+    if(!progress) wireDash();
+    b.scrollTop=st; return;
+  }
+  const stacks=(F.kind.get('Stack')?F.kind.get('Stack').n:0)+(F.kind.get('Virtual Chassis')?F.kind.get('Virtual Chassis').n:0);
+  const kp=(v,l,s)=>'<div class="kpi"><b>'+v+'</b><span>'+l+'</span>'+(s?'<small>'+s+'</small>':'')+'</div>';
+  h+='<div class="kpis">'+
+    kp(S.devices,'Équipements',dash.dedupe&&dash.raws.length!==S.devices?dash.raws.length+' configurations lues':'')+
+    kp(S.units,'Switchs physiques (unités)',stacks?stacks+' stack / VC':'')+
+    kp(F.model.size,'Modèles distincts',S.unknownUnits?S.unknownUnits+' unité(s) à identifier':'')+
+    kp(S.portsTotal,'Ports (total connu)',S.portsUnknownUnits?S.portsUnknownUnits+' unité(s) sans nombre de ports':'')+
+    kp(S.poeYes,'Switchs PoE',S.poeUnk?S.poeUnk+' indéterminé(s)':'')+
+    kp(F.fw.size,'Versions de firmware')+'</div>';
+  if(S.unknownUnits||S.poeUnk||S.portsUnknownUnits)
+    h+='<div class="warn">⚠️ <span><b>'+S.unknownUnits+'</b> unité(s) sans modèle identifié, <b>'+S.portsUnknownUnits+'</b> sans nombre de ports, <b>'+S.poeUnk+'</b> avec PoE indéterminé. Complète le catalogue pour affiner ces chiffres.</span><button class="sec" data-a="dcat">Catalogue matériel…</button></div>';
+  const card=(t,inner,scroll)=>'<section class="card"><h3>'+t+'</h3>'+(scroll?'<div class="scroll">':'')+inner+(scroll?'</div>':'')+'</section>';
+  const portsE=[...F.ports].sort((a,c)=>{ const x=parseInt(a[0]), y=parseInt(c[0]); return isNaN(x)?1:isNaN(y)?-1:x-y; });
+  const vlanE=[...F.vlan].sort(byCount).slice(0,15).map(([id,o])=>[id,o,'VLAN '+id+(S.vname.get(+id)?' — '+S.vname.get(+id):'')]);
+  const pt=F.poe, tot=[...pt.values()].reduce((a,o)=>a+o.n,0)||1, order=['PoE','Non PoE','Indéterminé'];
+  let acc=0; const stops=order.map(k=>{ const n=pt.has(k)?pt.get(k).n:0, from=acc/tot*100; acc+=n; return POE_COL[k]+' '+from.toFixed(2)+'% '+(acc/tot*100).toFixed(2)+'%'; });
+  const poeH='<div class="poe"><div class="donut" style="background:conic-gradient('+stops.join(',')+')"></div><div class="leg">'+
+    order.filter(k=>pt.has(k)).map(k=>'<div class="bar lg'+(sel&&sel.f==='poe'&&sel.v===k?' on':'')+'" data-facet="poe" data-val="'+k+'"><span class="dot" style="background:'+POE_COL[k]+'"></span><span class="lbl">'+k+'</span><span class="n">'+pt.get(k).n+' ('+Math.round(pt.get(k).n/tot*100)+' %)</span></div>').join('')+'</div></div>';
+  h+='<div class="dgrid">'+
+    card('Constructeurs',barsHtml('vendor',[...F.vendor].sort(byCount),sel))+
+    card('Modèles <small>(par unité)</small>',barsHtml('model',[...F.model].sort(byCount),sel),true)+
+    card('Ports par switch <small>(par unité)</small>',barsHtml('ports',portsE,sel))+
+    card('PoE <small>(par unité)</small>',poeH)+
+    card('Firmware',barsHtml('fw',[...F.fw].sort(byCount),sel),true)+
+    card('Topologie',barsHtml('kind',[...F.kind].sort(byCount),sel))+
+    card('VLAN les plus présents <small>(nb d\'équipements)</small>',barsHtml('vlan',vlanE,sel),true)+
+  '</div>'+(progress?'':'<div id="dlist">'+dashListHtml()+'</div>');
+  b.innerHTML=h;
+  if(!progress) wireDash();
+  b.scrollTop=st;
+}
+function wireDash(){
+  const dd=$('#dd'); if(dd) dd.onchange=()=>{ dash.dedupe=dd.checked; dash.filter=null; renderDash(); };
+}
+function dashSelection(){
+  const S=dash.stats, f=dash.filter; if(!S||!f) return null;
+  if(f.f==='all') return {title:'Tous les équipements',list:dash.devs};
+  const o=S.F[f.f]&&S.F[f.f].get(f.v);
+  return {title:FACET_NAME[f.f]+' : '+(f.f==='vlan'?'VLAN '+f.v:f.v),list:o?[...o.devs]:[]};
+}
+function dashListHtml(){
+  const sl=dashSelection();
+  if(!sl) return '<div class="hint">Clique sur une barre pour lister les équipements correspondants. <button class="sec" data-a="dall">Afficher tous les équipements</button></div>';
+  const list=sl.list.slice().sort((a,c)=>COLL.compare(a.host||a.file,c.host||c.file)), CAP=500;
+  let h='<div class="dhead"><b>'+esc(sl.title)+'</b><span class="m">'+list.length+' équipement(s)'+(list.length>CAP?' — '+CAP+' premiers affichés (export CSV pour la liste complète)':'')+'</span><button class="sec" data-a="dclear">Effacer le filtre</button></div>'+
+    '<table class="dl"><thead><tr><th>Hostname</th><th>Type</th><th>Modèle(s)</th><th>Unités</th><th>Ports</th><th>PoE</th><th>Firmware</th><th>IP</th><th>Fichier</th></tr></thead><tbody>';
+  for(const d of list.slice(0,CAP)){
+    const src=d.U.map(u=>u.name+' ['+u.src+']').join(', ')||'';
+    h+='<tr><td class="mono">'+esc(d.host||'—')+'</td><td>'+esc(d.vendorLabel)+'</td><td title="'+esc(src)+'">'+esc(d.modelTxt)+'</td><td>'+d.U.length+'</td><td title="'+(d.portsTxt[0]==='~'?'estimé d\'après la config':'')+'">'+esc(d.portsTxt)+'</td><td>'+esc(d.poeTxt)+'</td><td class="mono">'+esc(d.fwLabel)+'</td><td class="mono">'+esc(d.ips[0]||'—')+'</td>'+
+       '<td><a data-f="'+esc(d.file)+'" data-l="0" title="'+esc(d.file)+'">'+esc(base(d.file))+'</a></td></tr>';
+  }
+  return h+'</tbody></table>';
+}
+function pickFacet(f,v){
+  const cu=dash.filter;
+  dash.filter=(cu&&cu.f===f&&cu.v===v)?null:{f,v};
+  refreshDashList();
+}
+function refreshDashList(){
+  const f=dash.filter;
+  document.querySelectorAll('#body .bar').forEach(e=>e.classList.toggle('on',!!f&&e.dataset.facet===f.f&&e.dataset.val===f.v));
+  const l=$('#dlist'); if(!l) return;
+  l.innerHTML=dashListHtml();
+  if(f&&l.scrollIntoView) l.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+function csvDash(){
+  const sl=dashSelection(), list=sl?sl.list:dash.devs; if(!dash.stats) return;
+  const R=[['Hostname','Type','Modèle(s)','Unités','Ports','PoE','Firmware','Topologie','IP','Nb VLAN','Fichier','Date']];
+  list.slice().sort((a,c)=>COLL.compare(a.host||a.file,c.host||c.file)).forEach(d=>R.push([d.host,d.vendorLabel,d.modelTxt,d.U.length,d.portsTxt,d.poeTxt,d.fwLabel,d.kind,d.ips[0]||'',d.vlans.size,d.file,d.mtime?new Date(d.mtime).toISOString().slice(0,16).replace('T',' '):'']));
+  downloadCSV('tableau-de-bord.csv',R);
+}
+
+/* ---------- boîte de dialogue : catalogue matériel ---------- */
+function openCatalog(){ $('#cat-t').value=catalogText; $('#cat-e').textContent=''; $('#cat').showModal(); }
+function saveCatalog(){
+  const text=$('#cat-t').value;
+  try{ catalog=parseCatalog(text); }catch(e){ $('#cat-e').textContent=e.message; return; }
+  catalogText=text; try{ localStorage.setItem('catalog',text); }catch{}
+  $('#cat').close();
+  if(dash.on) renderDash();
+}
+function addUnknownToCatalog(){
+  let o; try{ o=JSON.parse($('#cat-t').value); }catch(e){ $('#cat-e').textContent='JSON invalide : '+e.message; return; }
+  if(!o||typeof o!=='object'||Array.isArray(o)) o={};
+  if(!o.models||typeof o.models!=='object'||Array.isArray(o.models)) o.models={};
+  const have=new Set(Object.keys(o.models).map(k=>k.toUpperCase())); let n=0;
+  for(const code of dash.unknown) if(!have.has(code)){ o.models[code]={name:'',ports:null,poe:null}; n++; }
+  $('#cat-t').value=JSON.stringify(o,null,2);
+  $('#cat-e').textContent=n?n+' référence(s) ajoutée(s) : renseigne « name », « ports » et « poe », puis enregistre.':'Aucune nouvelle référence à ajouter.';
+}
+
+/* =====================================================================
    Événements globaux
    ===================================================================== */
 $('#body').addEventListener('click',e=>{
@@ -626,9 +1000,16 @@ $('#body').addEventListener('click',e=>{
       case 'runfold': document.querySelectorAll('.rg').forEach(g=>g.classList.remove('c')); break;
       case 'csv-hits': csvHits(); break;
       case 'csv-files': csvFiles(); break;
+      case 'dcat': openCatalog(); break;
+      case 'dcsv': csvDash(); break;
+      case 'dref': showDashboard(); break;
+      case 'dall': dash.filter={f:'all',v:''}; refreshDashList(); break;
+      case 'dclear': dash.filter=null; refreshDashList(); break;
+      case 'pstop': stopFlag=true; break;
     }
     return;
   }
+  if((el=t.closest('.bar'))){ pickFacet(el.dataset.facet,el.dataset.val); return; }
   if((el=t.closest('.res-f .car'))){ el.closest('.rg').classList.toggle('c'); return; }
   if((el=t.closest('[data-f]'))){ openFile(el.dataset.f,+el.dataset.l||0); return; }
 });
@@ -639,6 +1020,11 @@ $('#body').addEventListener('scroll',()=>{
 if(typeof ResizeObserver!=='undefined') new ResizeObserver(()=>{ if(VW.on) updateViewer(true); }).observe($('#body'));
 
 $('#go').onclick=search; $('#stop').onclick=()=>{ stopFlag=true; };
+$('#db').onclick=showDashboard;
+$('#cat-save').onclick=saveCatalog; $('#cat-cancel').onclick=()=>$('#cat').close(); $('#cat-unk').onclick=addUnknownToCatalog;
+$('#cat-exp').onclick=()=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([$('#cat-t').value],{type:'application/json'})); a.download='catalogue-materiel.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),5000); };
+$('#cat-imp').onclick=()=>$('#cat-file').click();
+$('#cat-file').onchange=async e=>{ const f=e.target.files[0]; if(f){ $('#cat-t').value=await f.text(); $('#cat-e').textContent=''; } e.target.value=''; };
 $('#q').onkeydown=e=>{ if(e.key==='Enter') search(); };
 $('#q').oninput=()=>{ if(!$('#q').value&&showingResults) empty(); };
 
