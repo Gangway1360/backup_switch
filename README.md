@@ -1,3 +1,4 @@
+[Uploading README.md…]()
 # 📂 Explorateur de configs
 
 Interface web **100 % locale** pour parcourir, lire et rechercher des fichiers de configuration de switchs (**HP/Aruba ProCurve** et **Alcatel-Lucent OmniSwitch**) stockés sur un dossier ou un lecteur réseau.
@@ -48,6 +49,45 @@ Le dossier des configs n'a pas besoin d'être à côté de l'outil : l'outil lit
   - *CSV fichiers* : fichier, nombre d'occurrences (pratique pour répondre à « quels switchs portent le VLAN 1551 ? »).
 - Recherche interruptible, indicateur de progression.
 
+### Tableau de bord (📊)
+Synthèse du parc à partir des configs du dossier courant (ou de tout l'arbre si « dossier courant » est décoché) :
+
+- **Indicateurs** : équipements, switchs physiques (un stack ou un Virtual Chassis compte pour plusieurs unités), modèles distincts, ports, switchs PoE, versions de firmware.
+- **Répartitions cliquables** : constructeur, modèle, nombre de ports par switch, PoE / non PoE, firmware, topologie (autonome / stack / Virtual Chassis), VLAN les plus présents.
+- **Détail** : un clic sur une barre liste les équipements correspondants (hostname, modèle, ports, PoE, firmware, IP, lien vers la config). Export **CSV** de la liste affichée.
+- **Dernière sauvegarde par équipement** (activé par défaut) : si le dossier contient plusieurs sauvegardes du même switch, seule la plus récente est comptée (clé : constructeur + hostname).
+
+**D'où viennent les informations** (par ordre de priorité) :
+
+| Information | Source |
+|---|---|
+| Modèle | catalogue utilisateur → table intégrée → règles (hostname / fichier) → référence produit lue dans la config |
+| Nombre de ports | catalogue / règle → estimation d'après les ports cités dans la config (ProCurve uniquement, arrondie à la classe 8/12/16/24/48) |
+| PoE | catalogue / règle → nom du modèle contenant « PoE » → présence de commandes PoE dans la config (`power-over-ethernet…`, `lanpower…`) |
+| Firmware | en-tête ProCurve (`Created on release #…`) |
+| Stack / VC | blocs `stacking … member N type "…"` (ProCurve), `virtual-chassis chassis-id N` ou ports `1/…`, `2/…` (OmniSwitch) |
+
+Les configs ne contiennent pas toujours le modèle exact, le nombre de ports ni le PoE (**l'absence de commande PoE ne prouve pas l'absence de PoE**). Ces cas apparaissent comme « Modèle inconnu », « Non renseigné » ou « Indéterminé », avec un bandeau d'avertissement. Pour les lever, complète le **catalogue matériel** (bouton *Catalogue matériel…*) :
+
+```json
+{
+  "models": {
+    "J4899B": { "name": "HP ProCurve 2650", "ports": 48, "poe": false }
+  },
+  "rules": [
+    { "match": "^SW-IDF", "on": "host", "name": "OS6860E-P48", "ports": 48, "poe": true }
+  ]
+}
+```
+
+- `models` : par référence produit (celle de l'en-tête ou du bloc `stacking`).
+- `rules` : par expression régulière sur le hostname (`"on": "host"`), le chemin du fichier (`"on": "file"`) ou les deux (par défaut). Utile pour OmniSwitch, dont les configs n'indiquent pas le modèle.
+- Le bouton *Ajouter les références non identifiées* pré-remplit le catalogue avec les références détectées, à compléter.
+- Le catalogue est enregistré dans le navigateur (`localStorage`) ; import / export en JSON pour le partager ou le sauvegarder.
+- `ports` = ports d'accès (classe 24 / 48), hors uplinks.
+
+La table intégrée ne contient que quelques références courantes (Aruba/HP 2530, 2920, 2930F, 2810). **Elle est à vérifier** ; le catalogue utilisateur est toujours prioritaire.
+
 ### Confort
 - Croix **×** dans les champs de saisie (et `Échap`) pour les vider.
 - Thème clair / sombre automatique (selon le système).
@@ -88,6 +128,8 @@ Les fichiers sont décodés en UTF-8, avec repli automatique sur Windows-1252.
 - La visionneuse étant virtualisée, `Ctrl+F` du navigateur ne voit que les lignes affichées : utilise le champ **Chercher dans le fichier**. La sélection à la souris fonctionne sur les lignes affichées ; pour tout récupérer, utilise **Copier**.
 - Chrome / Edge refusent de sélectionner la **racine d'un lecteur** (`Z:\`) ou certains dossiers système : choisis un sous-répertoire (`Z:\configs`).
 - Sur un partage réseau, la première recherche relit les fichiers via SMB et peut prendre quelques secondes.
+- Tableau de bord : le nombre de ports d'un **OmniSwitch** n'est pas estimé (les ports du VLAN par défaut ne figurent pas dans la config) : renseigne-le via une règle du catalogue. Les switchs sans commande PoE dans leur config restent « Indéterminé » tant que le modèle n'est pas identifié.
+- Le tableau de bord lit tous les fichiers du périmètre choisi (le cache accélère les analyses suivantes).
 - La détection du format s'appuie sur les syntaxes ProCurve et OmniSwitch courantes. Une syntaxe atypique se lit normalement mais peut ne pas bénéficier de tous les regroupements de sections.
 
 ## Hébergement (optionnel)
@@ -112,7 +154,7 @@ location /configs/ {
 ## Sécurité et vie privée
 
 - Aucune requête réseau : ni analytics, ni CDN, ni police externe.
-- Les données restent dans le navigateur. Par défaut, seuls le dernier dossier (IndexedDB) et la largeur de la colonne (localStorage) sont mémorisés. Le contenu des fichiers n'est conservé sur disque que si tu actives *cache disque*.
+- Les données restent dans le navigateur. Par défaut, seuls le dernier dossier (IndexedDB), la largeur de la colonne et le catalogue matériel (localStorage) sont mémorisés. Le contenu des fichiers n'est conservé sur disque que si tu actives *cache disque*.
 - Le contenu des fichiers est toujours échappé avant affichage.
 - Les exports CSV neutralisent les débuts de cellule pouvant être interprétés comme des formules par Excel (`=`, `+`, `-`, `@`).
 - Les configs contiennent souvent des secrets (communautés SNMP, mots de passe, clés RADIUS) : pense-y avant de partager une capture ou un export.
@@ -122,10 +164,10 @@ location /configs/ {
 ```
 config_browser/
 ├── index.html   # structure de la page
-├── style.css    # thème clair/sombre, coloration, sections repliables, résultats
+├── style.css    # thème clair/sombre, coloration, sections repliables, résultats, tableau de bord
 └── app.js       # sources de fichiers, caches, analyse, coloration, repli, visionneuse virtualisée, recherche, CSV
 ```
 
-Dans `app.js`, les grandes parties sont, dans l'ordre : index et sources de fichiers, **caches** (`getText`), liste, **analyse** (`detectVendor`, `tokenize`, `computeFolds`), **visionneuse virtualisée** (`rebuildVis`, `renderRows`, `updateViewer`), **recherche** et exports CSV, événements globaux.
+Dans `app.js`, les grandes parties sont, dans l'ordre : index et sources de fichiers, **caches** (`getText`), liste, **analyse** (`detectVendor`, `tokenize`, `computeFolds`), **tableau de bord** (`extractDevice`, `unitInfo`, `computeStats`, `renderDash`), **visionneuse virtualisée** (`rebuildVis`, `renderRows`, `updateViewer`), **recherche** et exports CSV, événements globaux.
 
 Pour ajouter un constructeur, les points d'entrée sont `detectVendor()` (reconnaissance), `computeFolds()` (règles de repli) et `tokenize()` (coloration).
